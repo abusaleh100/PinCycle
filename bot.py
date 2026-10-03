@@ -1,26 +1,18 @@
 import os
 import sqlite3
-import asyncio
+from datetime import datetime, timezone
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    CopyTextButton,
-)
-from telegram.constants import ChatType
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    ChatMemberHandler,
+    MessageHandler,
     filters,
 )
-
 
 # =========================================================
 # CONFIG
@@ -33,164 +25,379 @@ OWNER_USERNAME = "wabillah"
 
 DB_FILE = "pincycle.db"
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in Railway Variables.")
+
 
 # =========================================================
 # DATABASE
 # =========================================================
 
 db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
 
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    active INTEGER DEFAULT 1
-)
-""")
+db.execute("PRAGMA journal_mode=WAL")
 
-db.execute("""
-CREATE TABLE IF NOT EXISTS groups (
-    chat_id INTEGER PRIMARY KEY,
-    title TEXT,
-    owner_id INTEGER
+db.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        has_access INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS groups (
+        chat_id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        added_by INTEGER NOT NULL,
+        added_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_pins (
+        chat_id INTEGER PRIMARY KEY,
+        hours INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """
 )
-""")
 
 db.commit()
 
 
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
 # =========================================================
-# ACCESS
+# USER FUNCTIONS
 # =========================================================
 
-def has_access(user_id: int) -> bool:
+def save_user(user):
+    username = (user.username or "").lower()
 
+    db.execute(
+        """
+        INSERT INTO users (user_id, username)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET username = excluded.username
+        """,
+        (user.id, username),
+    )
+
+    db.commit()
+
+
+def user_has_access(user_id):
     if user_id == OWNER_ID:
         return True
 
     row = db.execute(
-        "SELECT active FROM users WHERE user_id = ?",
-        (user_id,)
+        "SELECT has_access FROM users WHERE user_id = ?",
+        (user_id,),
     ).fetchone()
 
-    return bool(row and row[0] == 1)
+    return bool(row and row["has_access"])
 
 
-def grant_access(user_id: int):
-
-    db.execute(
-        """
-        INSERT OR REPLACE INTO users(user_id, active)
-        VALUES (?, 1)
-        """,
-        (user_id,)
-    )
-
-    db.commit()
-
-
-def remove_access(user_id: int):
-
-    db.execute(
-        "UPDATE users SET active = 0 WHERE user_id = ?",
-        (user_id,)
-    )
-
-    db.commit()
-
-
-# =========================================================
-# GROUP DATABASE
-# =========================================================
-
-def save_group(chat_id: int, title: str, owner_id: int):
-
-    db.execute(
-        """
-        INSERT OR REPLACE INTO groups(chat_id, title, owner_id)
-        VALUES (?, ?, ?)
-        """,
-        (chat_id, title, owner_id)
-    )
-
-    db.commit()
-
-
-def get_group_owner(chat_id: int):
+def grant_access(username):
+    username = username.replace("@", "").lower()
 
     row = db.execute(
-        "SELECT owner_id FROM groups WHERE chat_id = ?",
-        (chat_id,)
+        """
+        SELECT user_id
+        FROM users
+        WHERE LOWER(username) = ?
+        """,
+        (username,),
     ).fetchone()
 
-    return row[0] if row else None
+    if not row:
+        return None
+
+    db.execute(
+        """
+        UPDATE users
+        SET has_access = 1
+        WHERE user_id = ?
+        """,
+        (row["user_id"],),
+    )
+
+    db.commit()
+
+    return row["user_id"]
+
+
+def remove_access(username):
+    username = username.replace("@", "").lower()
+
+    row = db.execute(
+        """
+        SELECT user_id
+        FROM users
+        WHERE LOWER(username) = ?
+        """,
+        (username,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    if row["user_id"] == OWNER_ID:
+        return row["user_id"]
+
+    db.execute(
+        """
+        UPDATE users
+        SET has_access = 0
+        WHERE user_id = ?
+        """,
+        (row["user_id"],),
+    )
+
+    db.commit()
+
+    return row["user_id"]
 
 
 # =========================================================
-# MAIN MENU
+# GROUP FUNCTIONS
+# =========================================================
+
+def add_group(chat_id, title, user_id):
+    db.execute(
+        """
+        INSERT INTO groups
+        (chat_id, title, added_by, added_at)
+        VALUES (?, ?, ?, ?)
+
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+            title = excluded.title,
+            added_by = excluded.added_by
+        """,
+        (
+            chat_id,
+            title,
+            user_id,
+            now(),
+        ),
+    )
+
+    db.commit()
+
+
+def remove_group(chat_id, user_id):
+    db.execute(
+        """
+        DELETE FROM groups
+        WHERE chat_id = ?
+        AND added_by = ?
+        """,
+        (
+            chat_id,
+            user_id,
+        ),
+    )
+
+    db.execute(
+        """
+        DELETE FROM pending_pins
+        WHERE chat_id = ?
+        """,
+        (chat_id,),
+    )
+
+    db.commit()
+
+
+def get_groups(user_id):
+    return db.execute(
+        """
+        SELECT chat_id, title
+        FROM groups
+        WHERE added_by = ?
+        ORDER BY title
+        """,
+        (user_id,),
+    ).fetchall()
+
+
+# =========================================================
+# KEYBOARDS
 # =========================================================
 
 def main_menu():
 
-    keyboard = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "➕ Add Group",
-                callback_data="add_group"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📋 Useful Commands",
-                callback_data="useful_commands"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👤 Contact Owner",
-                url=f"https://t.me/{OWNER_USERNAME}"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    # No access
-    if not has_access(user.id):
-
-        keyboard = [
             [
                 InlineKeyboardButton(
+                    "➕ Add Group",
+                    callback_data="add_group",
+                ),
+                InlineKeyboardButton(
+                    "📂 My Group",
+                    callback_data="my_group",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 Useful Commands",
+                    callback_data="commands",
+                ),
+                InlineKeyboardButton(
                     "👤 Contact Owner",
-                    url=f"https://t.me/{OWNER_USERNAME}"
+                    url=f"https://t.me/{OWNER_USERNAME}",
+                ),
+            ],
+        ]
+    )
+
+
+def back_button(callback="home"):
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data=callback,
                 )
             ]
         ]
+    )
+
+
+def contact_owner_button():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "👤 Contact Owner",
+                    url=f"https://t.me/{OWNER_USERNAME}",
+                )
+            ]
+        ]
+    )
+
+
+# =========================================================
+# ACCESS DENIED
+# =========================================================
+
+def access_denied_text():
+
+    return (
+        "❌ You don't have access to use Pin Cycle.\n\n"
+        "Please contact the owner to request access."
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    if not user_has_access(user.id):
 
         await update.message.reply_text(
-            "❌ You don't have access to use Pin Cycle.\n\n"
-            "Please contact the owner to request access.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            access_denied_text(),
+            reply_markup=contact_owner_button(),
         )
 
         return
 
-    # Access granted
     await update.message.reply_text(
-        "✅ Pin Cycle\n\n"
-        "Select an option below:",
-        reply_markup=main_menu()
+        "📌 Pin Cycle",
+        reply_markup=main_menu(),
+    )
+
+
+# =========================================================
+# /ACCESS
+# =========================================================
+
+async def access_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    if user.id != OWNER_ID:
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n/access @username"
+        )
+
+        return
+
+    username = context.args[0]
+
+    target = grant_access(username)
+
+    if target is None:
+
+        await update.message.reply_text(
+            "❌ User not found.\n\n"
+            "Ask the user to open the bot and press /start first."
+        )
+
+        return
+
+    await update.message.reply_text(
+        f"✅ Access granted to {username}."
+    )
+
+
+# =========================================================
+# /REMOVEACCESS
+# =========================================================
+
+async def remove_access_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    if user.id != OWNER_ID:
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n/removeaccess @username"
+        )
+
+        return
+
+    username = context.args[0]
+
+    target = remove_access(username)
+
+    if target is None:
+
+        await update.message.reply_text(
+            "❌ User not found."
+        )
+
+        return
+
+    await update.message.reply_text(
+        f"✅ Access removed from {username}."
     )
 
 
@@ -200,21 +407,41 @@ async def start(
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
 
     await query.answer()
 
-    user_id = query.from_user.id
+    user = query.from_user
 
-    # Access check
-    if not has_access(user_id):
+    save_user(user)
+
+    # -----------------------------------------------------
+    # ACCESS CHECK
+    # -----------------------------------------------------
+
+    if not user_has_access(user.id):
 
         await query.edit_message_text(
-            "❌ You don't have access to use Pin Cycle.\n\n"
-            "Please contact the owner to request access."
+            access_denied_text(),
+            reply_markup=contact_owner_button(),
+        )
+
+        return
+
+    data = query.data
+
+    # =====================================================
+    # HOME
+    # =====================================================
+
+    if data == "home":
+
+        await query.edit_message_text(
+            "📌 Pin Cycle",
+            reply_markup=main_menu(),
         )
 
         return
@@ -223,27 +450,265 @@ async def button_handler(
     # ADD GROUP
     # =====================================================
 
-    if query.data == "add_group":
+    if data == "add_group":
 
-        select_button = KeyboardButton(
+        groups = get_groups(user.id)
+
+        if not groups:
+
+            await query.edit_message_text(
+                "➕ Add Group\n\n"
+                "No group is available yet.\n\n"
+                "Add PinCycleBOT to your group as an admin "
+                "and give it permission to pin messages.\n\n"
+                "After that, use /pin 4h, /pin 8h, "
+                "/pin 12h or /pin 24h in the group.",
+                reply_markup=back_button("home"),
+            )
+
+            return
+
+        buttons = []
+
+        for group in groups:
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        group["title"][:50],
+                        callback_data=f"select_group:{group['chat_id']}",
+                    )
+                ]
+            )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="home",
+                )
+            ]
+        )
+
+        await query.edit_message_text(
             "➕ Select Group",
-            request_chat={
-                "request_id": 1,
-                "chat_is_channel": False,
-                "chat_is_forum": False,
-                "bot_is_member": False,
-            }
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-        keyboard = ReplyKeyboardMarkup(
-            [[select_button]],
-            resize_keyboard=True,
-            one_time_keyboard=True
+        return
+
+    # =====================================================
+    # SELECT GROUP
+    # =====================================================
+
+    if data.startswith("select_group:"):
+
+        chat_id = int(
+            data.split(":", 1)[1]
         )
 
-        await query.message.reply_text(
-            "Select the group where you want to use Pin Cycle.",
-            reply_markup=keyboard
+        group = db.execute(
+            """
+            SELECT title
+            FROM groups
+            WHERE chat_id = ?
+            AND added_by = ?
+            """,
+            (
+                chat_id,
+                user.id,
+            ),
+        ).fetchone()
+
+        if not group:
+
+            await query.edit_message_text(
+                "❌ Group not found.",
+                reply_markup=back_button("add_group"),
+            )
+
+            return
+
+        await query.edit_message_text(
+            f"✅ {group['title']} is ready.\n\n"
+            "Use one of these commands in the group:\n\n"
+            "`/pin 4h`\n"
+            "`/pin 8h`\n"
+            "`/pin 12h`\n"
+            "`/pin 24h`",
+            parse_mode="Markdown",
+            reply_markup=back_button("home"),
+        )
+
+        return
+
+    # =====================================================
+    # MY GROUP
+    # =====================================================
+
+    if data == "my_group":
+
+        groups = get_groups(user.id)
+
+        if not groups:
+
+            await query.edit_message_text(
+                "📂 My Groups\n\n"
+                "No groups added yet.",
+                reply_markup=back_button("home"),
+            )
+
+            return
+
+        buttons = []
+
+        for group in groups:
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        group["title"][:50],
+                        callback_data=f"group_info:{group['chat_id']}",
+                    )
+                ]
+            )
+
+        # REMOVE GROUP ONLY ONCE
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "🗑 Remove Group",
+                    callback_data="remove_group",
+                )
+            ]
+        )
+
+        # BACK UNDER REMOVE GROUP
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="home",
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            "📂 My Groups",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+        return
+
+    # =====================================================
+    # GROUP INFO
+    # =====================================================
+
+    if data.startswith("group_info:"):
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
+
+        group = db.execute(
+            """
+            SELECT title
+            FROM groups
+            WHERE chat_id = ?
+            AND added_by = ?
+            """,
+            (
+                chat_id,
+                user.id,
+            ),
+        ).fetchone()
+
+        if not group:
+
+            await query.edit_message_text(
+                "❌ Group not found.",
+                reply_markup=back_button("my_group"),
+            )
+
+            return
+
+        await query.edit_message_text(
+            f"📂 {group['title']}\n\n"
+            "Pin commands:\n\n"
+            "`/pin 4h`\n"
+            "`/pin 8h`\n"
+            "`/pin 12h`\n"
+            "`/pin 24h`",
+            parse_mode="Markdown",
+            reply_markup=back_button("my_group"),
+        )
+
+        return
+
+    # =====================================================
+    # REMOVE GROUP
+    # =====================================================
+
+    if data == "remove_group":
+
+        groups = get_groups(user.id)
+
+        if not groups:
+
+            await query.edit_message_text(
+                "🗑 No groups to remove.",
+                reply_markup=back_button("my_group"),
+            )
+
+            return
+
+        buttons = []
+
+        for group in groups:
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"🗑 {group['title'][:45]}",
+                        callback_data=f"remove:{group['chat_id']}",
+                    )
+                ]
+            )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="my_group",
+                )
+            ]
+        )
+
+        await query.edit_message_text(
+            "🗑 Select a group to remove:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+        return
+
+    # =====================================================
+    # REMOVE SELECTED GROUP
+    # =====================================================
+
+    if data.startswith("remove:"):
+
+        chat_id = int(
+            data.split(":", 1)[1]
+        )
+
+        remove_group(
+            chat_id,
+            user.id,
+        )
+
+        await query.edit_message_text(
+            "✅ Group removed.",
+            reply_markup=back_button("my_group"),
         )
 
         return
@@ -252,155 +717,93 @@ async def button_handler(
     # USEFUL COMMANDS
     # =====================================================
 
-    if query.data == "useful_commands":
+    if data == "commands":
 
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    text="📋 /pin 4h",
-                    copy_text=CopyTextButton(
-                        text="/pin 4h"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 /pin 8h",
-                    copy_text=CopyTextButton(
-                        text="/pin 8h"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 /pin 12h",
-                    copy_text=CopyTextButton(
-                        text="/pin 12h"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 /pin 24h",
-                    copy_text=CopyTextButton(
-                        text="/pin 24h"
-                    )
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data="back_start"
-                )
-            ]
-        ]
-
-        await query.edit_message_text(
+        text = (
             "📋 Useful Commands\n\n"
-            "Use these commands in your group.\n"
-            "Tap any command to copy it and use it in your group.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "`/pin 4h`\n"
+            "`/pin 8h`\n"
+            "`/pin 12h`\n"
+            "`/pin 24h`\n\n"
+            "Only the next eligible member message "
+            "will be pinned."
         )
-
-        return
-
-    # =====================================================
-    # BACK
-    # =====================================================
-
-    if query.data == "back_start":
 
         await query.edit_message_text(
-            "✅ Pin Cycle\n\n"
-            "Select an option below:",
-            reply_markup=main_menu()
+            text,
+            parse_mode="Markdown",
+            reply_markup=back_button("home"),
         )
 
         return
 
 
 # =========================================================
-# GROUP SELECTED
+# BOT ADDED TO GROUP
 # =========================================================
 
-async def group_selected(
+async def bot_added_to_group(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    user = update.effective_user
-    shared = update.message.chat_shared
+    chat_member = update.my_chat_member
 
-    if not shared:
+    if not chat_member:
         return
 
-    if not has_access(user.id):
+    chat = update.effective_chat
+
+    if not chat:
         return
 
-    chat_id = shared.chat_id
+    if chat.type not in (
+        "group",
+        "supergroup",
+    ):
+        return
 
+    new_status = chat_member.new_chat_member.status
+
+    if new_status not in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+    ):
+        return
+
+    actor = chat_member.from_user
+
+    if not actor:
+        return
+
+    save_user(actor)
+
+    # Only users with access can register groups.
+    if not user_has_access(actor.id):
+        return
+
+    # Check bot permission if it is administrator.
     try:
 
-        chat = await context.bot.get_chat(chat_id)
-
-        # Must be group
-        if chat.type not in (
-            ChatType.GROUP,
-            ChatType.SUPERGROUP
-        ):
-
-            await update.message.reply_text(
-                "❌ Please select a group.",
-                reply_markup=ReplyKeyboardRemove()
-            )
-
-            return
-
-        # Check bot admin
         bot_member = await context.bot.get_chat_member(
-            chat_id,
-            context.bot.id
+            chat.id,
+            context.bot.id,
         )
 
-        if bot_member.status != "administrator":
+        if bot_member.status == ChatMemberStatus.ADMINISTRATOR:
 
-            await update.message.reply_text(
-                "❌ Pin Cycle must be an administrator "
-                "in this group.\n\n"
-                "Please add the bot as an admin and give it "
-                "Pin Messages and Delete Messages permission.",
-                reply_markup=ReplyKeyboardRemove()
-            )
+            if not bot_member.can_pin_messages:
 
-            return
+                return
 
-        # Save group
-        save_group(
-            chat_id,
-            chat.title or "Unnamed Group",
-            user.id
-        )
+    except Exception:
+        pass
 
-        await update.message.reply_text(
-            f"✅ Group added successfully.\n\n"
-            f"Group: {chat.title}\n\n"
-            "You can now use:\n"
-            "/pin 4h\n"
-            "/pin 8h\n"
-            "/pin 12h\n"
-            "/pin 24h",
-            reply_markup=ReplyKeyboardRemove()
-        )
-
-    except Exception as e:
-
-        print("GROUP ERROR:", e)
-
-        await update.message.reply_text(
-            "❌ Couldn't add this group.\n\n"
-            "Make sure Pin Cycle is added as an administrator.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+    add_group(
+        chat.id,
+        chat.title or "Unnamed Group",
+        actor.id,
+    )
 
 
 # =========================================================
@@ -409,402 +812,125 @@ async def group_selected(
 
 async def pin_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     message = update.effective_message
+
+    chat = update.effective_chat
+
     user = update.effective_user
-    chat = update.effective_chat
-
-    # Only groups
-    if chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    # Access
-    if not has_access(user.id):
-        return
-
-    # Group must belong to user
-    group_owner = get_group_owner(chat.id)
-
-    if group_owner != user.id:
-        return
-
-    # Need argument
-    if not context.args:
-        return
-
-    value = context.args[0].lower().strip()
-
-    durations = {
-        "4h": 4 * 60 * 60,
-        "8h": 8 * 60 * 60,
-        "12h": 12 * 60 * 60,
-        "24h": 24 * 60 * 60,
-    }
-
-    if value not in durations:
-        return
-
-    seconds = durations[value]
-
-    # Delete command immediately
-    try:
-        await message.delete()
-    except Exception as e:
-        print("COMMAND DELETE ERROR:", e)
-
-    # Cancel previous task
-    old_task = context.application.chat_data.get(
-        chat.id,
-        {}
-    ).get("pin_task")
-
-    if old_task:
-        old_task.cancel()
-
-    # Save cycle
-    context.application.chat_data.setdefault(
-        chat.id,
-        {}
-    )
-
-    context.application.chat_data[chat.id]["waiting"] = True
-    context.application.chat_data[chat.id]["duration"] = seconds
-
-    # Alert
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=(
-            f"✅ Pin Cycle is ready. "
-            f"The next post will be pinned for "
-            f"{value[:-1]} hours, except admins."
-        )
-    )
-
-
-# =========================================================
-# MEMBER MESSAGE
-# =========================================================
-
-async def member_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = update.effective_message
-    chat = update.effective_chat
 
     if not message or not chat:
         return
 
-    # Only groups
     if chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
+        "group",
+        "supergroup",
     ):
         return
-
-    data = context.application.chat_data.get(chat.id)
-
-    if not data:
-        return
-
-    # Waiting for next member post
-    if not data.get("waiting"):
-        return
-
-    user = message.from_user
 
     if not user:
         return
 
-    # Ignore bots
-    if user.is_bot:
+    save_user(user)
+
+    # -----------------------------------------------------
+    # ACCESS CHECK
+    # -----------------------------------------------------
+
+    if not user_has_access(user.id):
         return
 
-    # =====================================================
-    # ADMIN CHECK
-    # =====================================================
+    # -----------------------------------------------------
+    # CHECK GROUP
+    # -----------------------------------------------------
 
-    try:
-
-        member = await context.bot.get_chat_member(
+    group = db.execute(
+        """
+        SELECT chat_id
+        FROM groups
+        WHERE chat_id = ?
+        AND added_by = ?
+        """,
+        (
             chat.id,
-            user.id
+            user.id,
+        ),
+    ).fetchone()
+
+    if not group:
+
+        await message.reply_text(
+            "❌ This group is not added to your Pin Cycle."
         )
 
-        if member.status in (
-            "administrator",
-            "creator"
-        ):
-            return
-
-    except Exception as e:
-
-        print("ADMIN CHECK ERROR:", e)
         return
 
-    duration = data.get("duration")
-
-    if not duration:
-        return
-
-    # This is the next member post
-    data["waiting"] = False
-
-    try:
-
-        await context.bot.pin_chat_message(
-            chat_id=chat.id,
-            message_id=message.message_id,
-            disable_notification=True
-        )
-
-    except Exception as e:
-
-        print("PIN ERROR:", e)
-
-        data["waiting"] = True
-
-        return
-
-    # Start timer
-    task = asyncio.create_task(
-        unpin_after(
-            context,
-            chat.id,
-            message.message_id,
-            duration
-        )
-    )
-
-    data["pin_task"] = task
-
-
-# =========================================================
-# AUTO UNPIN
-# =========================================================
-
-async def unpin_after(
-    context,
-    chat_id,
-    message_id,
-    duration
-):
-
-    try:
-
-        await asyncio.sleep(duration)
-
-        try:
-
-            await context.bot.unpin_chat_message(
-                chat_id=chat_id,
-                message_id=message_id
-            )
-
-        except Exception as e:
-
-            print("UNPIN ERROR:", e)
-
-        data = context.application.chat_data.get(chat_id)
-
-        if data:
-
-            data["waiting"] = False
-            data.pop("pin_task", None)
-
-    except asyncio.CancelledError:
-
-        pass
-
-
-# =========================================================
-# OWNER: /ACCESS
-# =========================================================
-
-async def access_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    # Only owner
-    if user.id != OWNER_ID:
-        return
+    # -----------------------------------------------------
+    # CHECK DURATION
+    # -----------------------------------------------------
 
     if not context.args:
 
-        await update.message.reply_text(
+        await message.reply_text(
             "Usage:\n\n"
-            "/access USER_ID"
+            "/pin 4h\n"
+            "/pin 8h\n"
+            "/pin 12h\n"
+            "/pin 24h"
         )
 
         return
 
-    try:
+    duration = context.args[0].lower()
 
-        user_id = int(context.args[0])
+    allowed = {
+        "4h": 4,
+        "8h": 8,
+        "12h": 12,
+        "24h": 24,
+    }
 
-    except ValueError:
+    if duration not in allowed:
 
-        await update.message.reply_text(
-            "❌ Invalid Telegram user ID."
+        await message.reply_text(
+            "❌ Invalid duration.\n\n"
+            "Available:\n"
+            "/pin 4h\n"
+            "/pin 8h\n"
+            "/pin 12h\n"
+            "/pin 24h"
         )
 
         return
 
-    grant_access(user_id)
+    hours = allowed[duration]
 
-    await update.message.reply_text(
-        f"✅ Access granted successfully.\n\n"
-        f"User ID: {user_id}"
+    # -----------------------------------------------------
+    # SAVE PENDING PIN
+    # -----------------------------------------------------
+
+    db.execute(
+        """
+        INSERT INTO pending_pins
+        (chat_id, hours, created_at)
+        VALUES (?, ?, ?)
+
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+            hours = excluded.hours,
+            created_at = excluded.created_at
+        """,
+        (
+            chat.id,
+            hours,
+            now(),
+        ),
     )
 
+    db.commit()
 
-# =========================================================
-# OWNER: /REMOVE
-# =========================================================
-
-async def remove_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    # Only owner
-    if user.id != OWNER_ID:
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n\n"
-            "/remove USER_ID"
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid Telegram user ID."
-        )
-
-        return
-
-    # Owner cannot remove himself
-    if user_id == OWNER_ID:
-
-        await update.message.reply_text(
-            "❌ You cannot remove the owner."
-        )
-
-        return
-
-    remove_access(user_id)
-
-    await update.message.reply_text(
-        f"✅ Access removed successfully.\n\n"
-        f"User ID: {user_id}"
-    )
-
-
-# =========================================================
-# ERROR
-# =========================================================
-
-async def error_handler(
-    update,
-    context
-):
-
-    print("BOT ERROR:", context.error)
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN is missing. "
-            "Add BOT_TOKEN in Railway Variables."
-        )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # Commands
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("pin", pin_command)
-    )
-
-    application.add_handler(
-        CommandHandler("access", access_command)
-    )
-
-    application.add_handler(
-        CommandHandler("remove", remove_command)
-    )
-
-    # Inline buttons
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-
-    # Group selector
-    application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.CHAT_SHARED,
-            group_selected
-        )
-    )
-
-    # Group messages
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS
-            & ~filters.COMMAND,
-            member_message
-        )
-    )
-
-    # Error handler
-    application.add_error_handler(
-        error_handler
-    )
-
-    print("Pin Cycle is running...")
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-# =========================================================
-# START BOT
-# =========================================================
-
-if __name__ == "__main__":
-    main()
+    # -----------------------------------------------------
+    # ALERT
+    # --------------------------------------------
